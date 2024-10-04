@@ -1,4 +1,4 @@
-﻿//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
 //|                                                   Trading-dong.mq5|
 //|                               Pivot, S1, R1, Previous Day High/Low|
 //|                                                    SnD Integration|
@@ -17,7 +17,7 @@ input group "=== Common Trading Inputs ==="
 input ENUM_TIMEFRAMES      Timeframe = PERIOD_CURRENT;         // Timeframe
 input int                  BackLimit = 1000;                   // Back Limit
 input int                  MagicNumber = 2345; //Magic Number
-input int                  ATRPeriod = 14; // ATR period for volatility calculation 
+input int                  ATRPeriod = 7; // ATR period for volatility calculation
 
 input group "=== Money Management Inputs"
 enum LOT_MODE_ENUM{
@@ -30,8 +30,11 @@ input LOT_MODE_ENUM        InpLotMode = LOT_MODE_FIXED; // lot mode
 input double               InpLots = 0.01; // lots / money / percent
 input int                  Slpoints = 400; //Stoploss (10 points = 1 pips, 0 = off)
 input bool                 InpStopLossTrailing = false; //Trailing stop loss?
+input bool                 UseSwingHighLowSL = false;  // Use swing high/low as stop-loss
+input int                  SwingLookbackPeriod = 10;     // Number of bars to look back for swing highs/lows
 
 input group "=== Supply and Demand Inputs ==="
+input bool                 EnableSnD = true;  // Enable Supply and Demand Zones 
 input string               zone_settings = "--- Zone Settings ---";
 input bool                 zone_show_weak = false;             // Show Weak Zones
 input bool                 zone_show_untested = true;          // Show Untested Zones
@@ -101,6 +104,9 @@ double ner_hi_zone_P2[];
 double ner_hi_zone_strength[];
 double ner_lo_zone_strength[];
 double ner_price_inside_zone[];
+double Close[];   // Array for close prices
+double High[];    // Array for high prices
+double Low[];     // Array for low prices
 int iATR_handle;
 double ATR[];
 int cnt = 0;
@@ -112,23 +118,32 @@ string lastBearishEngulfingObj = "";
 
 double pivot, s1, r1, prevHigh, prevLow;
 datetime openPositionDate;
+bool newBarDetected = false;  // Flag to track new bar detection
+datetime lastTradeTime = 0;  // Stores the time of the last trade
+int cooldownPeriodSeconds = 1800;  // Cooldown period in seconds (e.g., 1800 seconds = 30 minutes)
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   prefix = string_prefix + "#";
-   if(Timeframe == PERIOD_CURRENT)
+  prefix = string_prefix + "#";
+   if (Timeframe == PERIOD_CURRENT)
       timeframe = Period();
    else
       timeframe = Timeframe;
+      
+   // Refresh data for the new timeframe
+   RefreshTimeframeData();
+   
    iATR_handle = iATR(NULL, timeframe, ATRPeriod);
-   
-   if(!CheckInputs()){return INIT_PARAMETERS_INCORRECT;}
-   
+
+   if (!CheckInputs())
+      return INIT_PARAMETERS_INCORRECT;
+
    trade.SetExpertMagicNumber(MagicNumber);
 
+   // Set arrays as series and resize once during initialization
    ArraySetAsSeries(SlowDnPts, true);
    ArraySetAsSeries(SlowUpPts, true);
    ArraySetAsSeries(FastDnPts, true);
@@ -141,12 +156,22 @@ int OnInit()
    ArraySetAsSeries(ner_lo_zone_strength, true);
    ArraySetAsSeries(ner_price_inside_zone, true);
    
-   return(INIT_SUCCEEDED);
+   // Delete all zones if SnD is disabled
+   if (!EnableSnD) 
+   {
+      DeleteZones();  // Remove any existing SnD objects
+   }
+   
+   // Set a timer to run heavy calculations periodically (every 10 seconds)
+   EventSetTimer(10);
+
+   return INIT_SUCCEEDED;
 }
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason){
+   EventKillTimer();  // Kill the timer to stop periodic processing
    DeleteZones();
    DeletePivotLevels();
    ChartRedraw();
@@ -156,30 +181,75 @@ void OnDeinit(const int reason){
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(NewBar() || (timeframe != PERIOD_CURRENT && try_again == true)){
-      FastFractals();
-      SlowFractals();
-      DeleteZones();
-      FindZones();
-      DrawZones();
-      showLabels();
-      getEngulfing();
-      DrawPivotLevels();
-      // Check for Engulfing Pattern
-      int engulfingSignal = getEngulfing(); // 1 for Bullish Engulfing, -1 for Bearish Engulfing, 0 for no signal
-   
-      if(engulfingSignal == 1) {  // Bullish Engulfing signal detected
-         OpenBuyOrder();
-      }
-      else if(engulfingSignal == -1) {  // Bearish Engulfing signal detected
-         OpenSellOrder();
-      }
-       // Call UpdateStopLoss function
-      UpdateStopLoss();
-      
-      // Check if the position was opened on a previous day
-      CheckClosePositionByDay();
+    // Check for new bar only, avoid heavy calculations here
+    if (NewBar())
+    {
+        newBarDetected = true;  // Flag to run calculations in OnTimer
     }
+
+    // Check for engulfing patterns and manage trades
+    int engulfingSignal = getEngulfing(); // 1 for Bullish Engulfing, -1 for Bearish Engulfing, 0 for no signal
+    //int DominantBreakSignal = getDominantBreak();
+
+    if (engulfingSignal == 1) // Bullish Engulfing detected
+    {
+        OpenBuyOrder();
+    }
+    else if (engulfingSignal == -1) // Bearish Engulfing detected
+    {
+        OpenSellOrder();
+    }
+
+    // Update stop loss for open positions if needed
+    UpdateStopLoss();
+
+    // Check if it's the end of the day to close open positions
+    CheckClosePositionByDay();
+}
+
+//+------------------------------------------------------------------+
+//| Timer function (Heavy Calculations)                              |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   if (newBarDetected)
+    {
+        // Perform heavy calculations here
+        FastFractals();
+        SlowFractals();
+
+        if (EnableSnD)  // Check if SnD is enabled
+        {
+            DeleteZones();
+            FindZones();
+            DrawZones();
+        }
+        else
+        {
+            DeleteZones();  // Remove any existing SnD objects
+        }
+
+        DrawPivotLevels();
+        showLabels();
+
+        newBarDetected = false;  // Reset flag after processing
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check for new bar formation                                      |
+//+------------------------------------------------------------------+
+bool NewBar()
+{
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(Symbol(), timeframe, 0);
+   
+   if (currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+   return false;
 }
  
 //+------------------------------------------------------------------+
@@ -187,298 +257,289 @@ void OnTick()
 //+------------------------------------------------------------------+
 void FindZones()
 {
-   int i, j, shift, bustcount = 0, testcount = 0;
-   double hival, loval;
-   bool turned = false, hasturned = false;
-   double temp_hi[1000], temp_lo[1000];
-   int temp_start[1000], temp_hits[1000], temp_strength[1000], temp_count = 0;
-   bool temp_turn[1000], temp_merge[1000];
-   int merge1[1000], merge2[1000], merge_count = 0;
+    if (!EnableSnD)  // Check if SnD is enabled
+        return;
+    int i, j, shift, bustcount = 0, testcount = 0;
+    double hival, loval;
+    bool turned = false, hasturned = false;
+    double temp_hi[1000], temp_lo[1000];
+    int temp_start[1000], temp_hits[1000], temp_strength[1000], temp_count = 0;
+    bool temp_turn[1000], temp_merge[1000];
+    int merge1[1000], merge2[1000], merge_count = 0;
 
-   // Determine the number of bars to use for calculations
-   shift = MathMin(Bars(Symbol(), timeframe) - 1, BackLimit + cnt);
-   shift = MathMin(shift, ArraySize(FastUpPts) - 1);
+    // Determine the number of bars to use for calculations
+    int max_bars = MathMin(Bars(Symbol(), timeframe) - 1, BackLimit);
+    shift = MathMin(max_bars, ArraySize(FastUpPts) - 1);
 
-   double Close[], High[], Low[];
-   
-   // Retrieve price data
-   ArrayResize(Close, shift + 1);
-   ArrayResize(High, shift + 1);
-   ArrayResize(Low, shift + 1);
-   ArrayResize(ATR, shift + 1);
+    // Resize arrays only once
+    ArrayResize(Close, shift + 1);
+    ArrayResize(High, shift + 1);
+    ArrayResize(Low, shift + 1);
+    ArrayResize(ATR, shift + 1);
 
-   for (i = 0; i <= shift; i++) {
-       Close[i] = iClose(Symbol(), timeframe, i);
-       High[i] = iHigh(Symbol(), timeframe, i);
-       Low[i] = iLow(Symbol(), timeframe, i);
-   }
+    // Retrieve price data for processing
+    for (i = 0; i <= shift; i++) {
+        Close[i] = iClose(Symbol(), timeframe, i);
+        High[i] = iHigh(Symbol(), timeframe, i);
+        Low[i] = iLow(Symbol(), timeframe, i);
+    }
 
-   // Get ATR values
-   if (CopyBuffer(iATR_handle, 0, 0, shift + 1, ATR) == -1)
-   {
-      try_again = true;
-      return;
-   }
-   else
-   {
-      if (StringFind(ChartGetString(0, CHART_COMMENT), "....") >= 0)
-         Comment("");
-      try_again = false;
-   }
+    // Get ATR values in a single call
+    if (CopyBuffer(iATR_handle, 0, 0, shift + 1, ATR) == -1)
+    {
+        try_again = true;
+        return;
+    }
+    else
+    {
+        try_again = false;
+    }
 
-   // Iterate through the bars and find zones
-   for (int ii = shift; ii > cnt + 5; ii--)
-   {
-      double atr = ATR[ii];
-      double fu = atr / 2 * zone_fuzzfactor;
-      bool isWeak;
-      bool touchOk = false;
-      bool isBust = false;
+    // Iterate through the bars and find zones
+    for (int ii = shift; ii > cnt + 5; ii--)
+    {
+        double atr = ATR[ii];
+        double fu = atr / 2 * zone_fuzzfactor;
+        bool isWeak;
+        bool touchOk = false;
+        bool isBust = false;
 
-      // Identify potential resistance zones
-      if (FastUpPts[ii] > 0.001)
-      {
-         isWeak = true;
-         if (SlowUpPts[ii] > 0.001)
-            isWeak = false;
+        // Use cached High, Low, and Close prices
+        double highPrice = High[ii];
+        double lowPrice = Low[ii];
+        double closePrice = Close[ii];
 
-         hival = High[ii];
-         if (zone_extend == true)
-            hival += fu;
-         loval = MathMax(MathMin(Close[ii], High[ii] - fu), High[ii] - fu * 2);
-         turned = false;
-         hasturned = false;
-         isBust = false;
-         bustcount = 0;
-         testcount = 0;
+        // Identify potential resistance zones
+        if (FastUpPts[ii] > 0.001)
+        {
+            isWeak = SlowUpPts[ii] <= 0.001;
+            hival = highPrice;
+            if (zone_extend) hival += fu;
+            loval = MathMax(MathMin(closePrice, highPrice - fu), highPrice - fu * 2);
+            turned = false;
+            hasturned = false;
+            bustcount = 0;
+            testcount = 0;
 
-         for (i = ii - 1; i >= cnt; i--)
-         {
-            if ((turned == false && FastUpPts[i] >= loval && FastUpPts[i] <= hival) ||
-                (turned == true && FastDnPts[i] <= hival && FastDnPts[i] >= loval))
+            for (i = ii - 1; i >= cnt; i--)
             {
-               touchOk = true;
-               for (j = i + 1; j < i + 11; j++)
-               {
-                  if ((turned == false && FastUpPts[j] >= loval && FastUpPts[j] <= hival) ||
-                      (turned == true && FastDnPts[j] <= hival && FastDnPts[j] >= loval))
-                  {
-                     touchOk = false;
-                     break;
-                  }
-               }
-               if (touchOk == true)
-               {
-                  bustcount = 0;
-                  testcount++;
-               }
-            }
-            if ((turned == false && High[i] > hival) || (turned == true && Low[i] < loval))
-            {
-               bustcount++;
-               if (bustcount > 1 || isWeak == true)
-               {
-                  isBust = true;
-                  break;
-               }
-               turned = !turned;
-               hasturned = true;
-               testcount = 0;
-            }
-         }
-         if (isBust == false)
-         {
-            temp_hi[temp_count] = hival;
-            temp_lo[temp_count] = loval;
-            temp_turn[temp_count] = hasturned;
-            temp_hits[temp_count] = testcount;
-            temp_start[temp_count] = ii;
-            temp_merge[temp_count] = false;
+                double high_i = High[i];
+                double low_i = Low[i];
+                double close_i = Close[i];
 
-            if (testcount > 3)
-               temp_strength[temp_count] = ZONE_PROVEN;
-            else if (testcount > 0)
-               temp_strength[temp_count] = ZONE_VERIFIED;
-            else if (hasturned == true)
-               temp_strength[temp_count] = ZONE_TURNCOAT;
-            else if (isWeak == false)
-               temp_strength[temp_count] = ZONE_UNTESTED;
+                if ((turned == false && FastUpPts[i] >= loval && FastUpPts[i] <= hival) ||
+                    (turned == true && FastDnPts[i] <= hival && FastDnPts[i] >= loval))
+                {
+                    touchOk = true;
+                    for (j = i + 1; j < i + 11; j++)
+                    {
+                        if ((turned == false && FastUpPts[j] >= loval && FastUpPts[j] <= hival) ||
+                            (turned == true && FastDnPts[j] <= hival && FastDnPts[j] >= loval))
+                        {
+                            touchOk = false;
+                            break;
+                        }
+                    }
+                    if (touchOk)
+                    {
+                        bustcount = 0;
+                        testcount++;
+                    }
+                }
+
+                if ((turned == false && high_i > hival) || (turned == true && low_i < loval))
+                {
+                    bustcount++;
+                    if (bustcount > 1 || isWeak)
+                    {
+                        isBust = true;
+                        break;
+                    }
+                    turned = !turned;
+                    hasturned = true;
+                    testcount = 0;
+                }
+            }
+            if (!isBust)
+            {
+                temp_hi[temp_count] = hival;
+                temp_lo[temp_count] = loval;
+                temp_turn[temp_count] = hasturned;
+                temp_hits[temp_count] = testcount;
+                temp_start[temp_count] = ii;
+                temp_merge[temp_count] = false;
+
+                if (testcount > 3) temp_strength[temp_count] = ZONE_PROVEN;
+                else if (testcount > 0) temp_strength[temp_count] = ZONE_VERIFIED;
+                else if (hasturned) temp_strength[temp_count] = ZONE_TURNCOAT;
+                else if (!isWeak) temp_strength[temp_count] = ZONE_UNTESTED;
+                else temp_strength[temp_count] = ZONE_WEAK;
+
+                temp_count++;
+            }
+        }
+        // Identify potential support zones
+        else if (FastDnPts[ii] > 0.001)
+        {
+            isWeak = SlowDnPts[ii] <= 0.001;
+            loval = lowPrice;
+            if (zone_extend) loval -= fu;
+            hival = MathMin(MathMax(closePrice, lowPrice + fu), lowPrice + fu * 2);
+            turned = false;
+            hasturned = false;
+            bustcount = 0;
+            testcount = 0;
+            isBust = false;
+
+            for (i = ii - 1; i >= cnt; i--)
+            {
+                double high_i = High[i];
+                double low_i = Low[i];
+                double close_i = Close[i];
+
+                if ((turned == true && FastUpPts[i] >= loval && FastUpPts[i] <= hival) ||
+                    (turned == false && FastDnPts[i] <= hival && FastDnPts[i] >= loval))
+                {
+                    touchOk = true;
+                    for (j = i + 1; j < i + 11; j++)
+                    {
+                        if ((turned == true && FastUpPts[j] >= loval && FastUpPts[j] <= hival) ||
+                            (turned == false && FastDnPts[j] <= hival && FastDnPts[j] >= loval))
+                        {
+                            touchOk = false;
+                            break;
+                        }
+                    }
+                    if (touchOk)
+                    {
+                        bustcount = 0;
+                        testcount++;
+                    }
+                }
+
+                if ((turned == true && high_i > hival) || (turned == false && low_i < loval))
+                {
+                    bustcount++;
+                    if (bustcount > 1 || isWeak)
+                    {
+                        isBust = true;
+                        break;
+                    }
+                    turned = !turned;
+                    hasturned = true;
+                    testcount = 0;
+                }
+            }
+            if (!isBust)
+            {
+                temp_hi[temp_count] = hival;
+                temp_lo[temp_count] = loval;
+                temp_turn[temp_count] = hasturned;
+                temp_hits[temp_count] = testcount;
+                temp_start[temp_count] = ii;
+                temp_merge[temp_count] = false;
+
+                if (testcount > 3) temp_strength[temp_count] = ZONE_PROVEN;
+                else if (testcount > 0) temp_strength[temp_count] = ZONE_VERIFIED;
+                else if (hasturned) temp_strength[temp_count] = ZONE_TURNCOAT;
+                else if (!isWeak) temp_strength[temp_count] = ZONE_UNTESTED;
+                else temp_strength[temp_count] = ZONE_WEAK;
+
+                temp_count++;
+            }
+        }
+    }
+
+    // Look for overlapping zones and merge them if necessary
+    if (zone_merge)
+    {
+        merge_count = 1;
+        int iterations = 0;
+        while (merge_count > 0 && iterations < 3)
+        {
+            merge_count = 0;
+            iterations++;
+            for (i = 0; i < temp_count; i++) temp_merge[i] = false;
+            for (i = 0; i < temp_count - 1; i++)
+            {
+                if (temp_hits[i] == -1 || temp_merge[i]) continue;
+                for (j = i + 1; j < temp_count; j++)
+                {
+                    if (temp_hits[j] == -1 || temp_merge[j]) continue;
+                    if ((temp_hi[i] >= temp_lo[j] && temp_hi[i] <= temp_hi[j]) ||
+                        (temp_lo[i] <= temp_hi[j] && temp_lo[i] >= temp_lo[j]) ||
+                        (temp_hi[j] >= temp_lo[i] && temp_hi[j] <= temp_hi[i]) ||
+                        (temp_lo[j] <= temp_hi[i] && temp_lo[j] >= temp_lo[i]))
+                    {
+                        merge1[merge_count] = i;
+                        merge2[merge_count] = j;
+                        temp_merge[i] = true;
+                        temp_merge[j] = true;
+                        merge_count++;
+                    }
+                }
+            }
+            for (i = 0; i < merge_count; i++)
+            {
+                int target = merge1[i];
+                int source = merge2[i];
+                temp_hi[target] = MathMax(temp_hi[target], temp_hi[source]);
+                temp_lo[target] = MathMin(temp_lo[target], temp_lo[source]);
+                temp_hits[target] += temp_hits[source];
+                temp_start[target] = MathMax(temp_start[target], temp_start[source]);
+                temp_strength[target] = MathMax(temp_strength[target], temp_strength[source]);
+
+                if (temp_hits[target] > 3) temp_strength[target] = ZONE_PROVEN;
+                if (temp_hits[target] == 0 && !temp_turn[target])
+                {
+                    temp_hits[target] = 1;
+                    if (temp_strength[target] < ZONE_VERIFIED)
+                        temp_strength[target] = ZONE_VERIFIED;
+                }
+                temp_turn[target] = temp_turn[target] && temp_turn[source];
+                temp_hits[source] = -1;
+            }
+        }
+    }
+
+    // Copy the zones into the official arrays
+    zone_count = 0;
+    for (i = 0; i < temp_count; i++)
+    {
+        if (temp_hits[i] >= 0 && zone_count < 1000)
+        {
+            zone_hi[zone_count] = temp_hi[i];
+            zone_lo[zone_count] = temp_lo[i];
+            zone_hits[zone_count] = temp_hits[i];
+            zone_turn[zone_count] = temp_turn[i];
+            zone_start[zone_count] = temp_start[i];
+            zone_strength[zone_count] = temp_strength[i];
+
+            if (zone_hi[zone_count] < Close[cnt])
+                zone_type[zone_count] = ZONE_SUPPORT;
+            else if (zone_lo[zone_count] > Close[cnt])
+                zone_type[zone_count] = ZONE_RESIST;
             else
-               temp_strength[temp_count] = ZONE_WEAK;
-
-            temp_count++;
-         }
-      }
-      // Identify potential support zones
-      else if (FastDnPts[ii] > 0.001)
-      {
-         isWeak = true;
-         if (SlowDnPts[ii] > 0.001)
-            isWeak = false;
-
-         loval = Low[ii];
-         if (zone_extend == true)
-            loval -= fu;
-         hival = MathMin(MathMax(Close[ii], Low[ii] + fu), Low[ii] + fu * 2);
-         turned = false;
-         hasturned = false;
-         bustcount = 0;
-         testcount = 0;
-         isBust = false;
-
-         for (i = ii - 1; i >= cnt; i--)
-         {
-            if ((turned == true && FastUpPts[i] >= loval && FastUpPts[i] <= hival) ||
-                (turned == false && FastDnPts[i] <= hival && FastDnPts[i] >= loval))
             {
-               touchOk = true;
-               for (j = i + 1; j < i + 11; j++)
-               {
-                  if ((turned == true && FastUpPts[j] >= loval && FastUpPts[j] <= hival) ||
-                      (turned == false && FastDnPts[j] <= hival && FastDnPts[j] >= loval))
-                  {
-                     touchOk = false;
-                     break;
-                  }
-               }
-               if (touchOk == true)
-               {
-                  bustcount = 0;
-                  testcount++;
-               }
+                for (j = cnt + 1; j < shift; j++)
+                {
+                    if (Close[j] < zone_lo[zone_count])
+                    {
+                        zone_type[zone_count] = ZONE_RESIST;
+                        break;
+                    }
+                    else if (Close[j] > zone_hi[zone_count])
+                    {
+                        zone_type[zone_count] = ZONE_SUPPORT;
+                        break;
+                    }
+                }
+                if (j == shift)
+                    zone_type[zone_count] = ZONE_SUPPORT;
             }
-            if ((turned == true && High[i] > hival) || (turned == false && Low[i] < loval))
-            {
-               bustcount++;
-               if (bustcount > 1 || isWeak == true)
-               {
-                  isBust = true;
-                  break;
-               }
-               turned = !turned;
-               hasturned = true;
-               testcount = 0;
-            }
-         }
-         if (isBust == false)
-         {
-            temp_hi[temp_count] = hival;
-            temp_lo[temp_count] = loval;
-            temp_turn[temp_count] = hasturned;
-            temp_hits[temp_count] = testcount;
-            temp_start[temp_count] = ii;
-            temp_merge[temp_count] = false;
-
-            if (testcount > 3)
-               temp_strength[temp_count] = ZONE_PROVEN;
-            else if (testcount > 0)
-               temp_strength[temp_count] = ZONE_VERIFIED;
-            else if (hasturned == true)
-               temp_strength[temp_count] = ZONE_TURNCOAT;
-            else if (isWeak == false)
-               temp_strength[temp_count] = ZONE_UNTESTED;
-            else
-               temp_strength[temp_count] = ZONE_WEAK;
-
-            temp_count++;
-         }
-      }
-   }
-
-   // Look for overlapping zones and merge them if necessary
-   if (zone_merge == true)
-   {
-      merge_count = 1;
-      int iterations = 0;
-      while (merge_count > 0 && iterations < 3)
-      {
-         merge_count = 0;
-         iterations++;
-         for (i = 0; i < temp_count; i++)
-            temp_merge[i] = false;
-         for (i = 0; i < temp_count - 1; i++)
-         {
-            if (temp_hits[i] == -1 || temp_merge[i] == true)
-               continue;
-            for (j = i + 1; j < temp_count; j++)
-            {
-               if (temp_hits[j] == -1 || temp_merge[j] == true)
-                  continue;
-               if ((temp_hi[i] >= temp_lo[j] && temp_hi[i] <= temp_hi[j]) ||
-                   (temp_lo[i] <= temp_hi[j] && temp_lo[i] >= temp_lo[j]) ||
-                   (temp_hi[j] >= temp_lo[i] && temp_hi[j] <= temp_hi[i]) ||
-                   (temp_lo[j] <= temp_hi[i] && temp_lo[j] >= temp_lo[i]))
-               {
-                  merge1[merge_count] = i;
-                  merge2[merge_count] = j;
-                  temp_merge[i] = true;
-                  temp_merge[j] = true;
-                  merge_count++;
-               }
-            }
-         }
-         for (i = 0; i < merge_count; i++)
-         {
-            int target = merge1[i];
-            int source = merge2[i];
-            temp_hi[target] = MathMax(temp_hi[target], temp_hi[source]);
-            temp_lo[target] = MathMin(temp_lo[target], temp_lo[source]);
-            temp_hits[target] += temp_hits[source];
-            temp_start[target] = MathMax(temp_start[target], temp_start[source]);
-            temp_strength[target] = MathMax(temp_strength[target], temp_strength[source]);
-
-            if (temp_hits[target] > 3)
-               temp_strength[target] = ZONE_PROVEN;
-            if (temp_hits[target] == 0 && temp_turn[target] == false)
-            {
-               temp_hits[target] = 1;
-               if (temp_strength[target] < ZONE_VERIFIED)
-                  temp_strength[target] = ZONE_VERIFIED;
-            }
-            temp_turn[target] = temp_turn[target] && temp_turn[source];
-            temp_hits[source] = -1;
-         }
-      }
-   }
-
-   // Copy the zones into the official arrays
-   zone_count = 0;
-   for (i = 0; i < temp_count; i++)
-   {
-      if (temp_hits[i] >= 0 && zone_count < 1000)
-      {
-         zone_hi[zone_count] = temp_hi[i];
-         zone_lo[zone_count] = temp_lo[i];
-         zone_hits[zone_count] = temp_hits[i];
-         zone_turn[zone_count] = temp_turn[i];
-         zone_start[zone_count] = temp_start[i];
-         zone_strength[zone_count] = temp_strength[i];
-
-         if (zone_hi[zone_count] < Close[cnt])
-            zone_type[zone_count] = ZONE_SUPPORT;
-         else if (zone_lo[zone_count] > Close[cnt])
-            zone_type[zone_count] = ZONE_RESIST;
-         else
-         {
-            for (j = cnt + 1; j < shift; j++)
-            {
-               if (Close[j] < zone_lo[zone_count])
-               {
-                  zone_type[zone_count] = ZONE_RESIST;
-                  break;
-               }
-               else if (Close[j] > zone_hi[zone_count])
-               {
-                  zone_type[zone_count] = ZONE_SUPPORT;
-                  break;
-               }
-            }
-            if (j == shift)
-               zone_type[zone_count] = ZONE_SUPPORT;
-         }
-         zone_count++;
-      }
-   }
+            zone_count++;
+        }
+    }
 }
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -493,7 +554,9 @@ void DrawZones()
    double higher_zone_strength = 0;
    double lower_zone_type = 0;
    double lower_zone_strength = 0;
-
+   
+   if (!EnableSnD)  // Check if SnD is enabled
+        return;
    for (int i = 0; i < zone_count; i++)
    {
       // Skip zones based on strength settings
@@ -643,54 +706,34 @@ bool Fractal(int M, int P, int shift)
 //+------------------------------------------------------------------+
 //|                                                                  |
 //+------------------------------------------------------------------+
-bool NewBar()
-{
-   // Static variable to store the last detected bar time
-   static datetime LastTime = 0;
-   
-   // Get the opening time of the current bar
-   datetime CurrentTime = iTime(Symbol(), timeframe, 0) + time_offset;
-
-   // If the current bar time is different from the last, a new bar has formed
-   if (CurrentTime != LastTime)
-   {
-      LastTime = CurrentTime;  // Update LastTime to the current bar time
-      return true;             // A new bar is detected
-   }
-
-   return false;  // No new bar detected
-}
-//+------------------------------------------------------------------+
-//|                                                                  |
-//+------------------------------------------------------------------+
 void DeleteZones()
 {
    // Get the length of the prefix to identify objects
-   int len = StringLen(prefix);
-   int total_objects = ObjectsTotal(0, 0, -1);  // Get total number of objects on the chart
-   int i = 0;
+    int len = StringLen(prefix);
+    int total_objects = ObjectsTotal(0, 0, -1);  // Get total number of objects on the chart
+    int i = 0;
 
-   // Loop through all objects on the chart
-   while (i < total_objects)
-   {
-      // Get the name of the object at index 'i'
-      string objName = ObjectName(0, i, 0, -1);
+    // Loop through all objects on the chart
+    while (i < total_objects)
+    {
+        // Get the name of the object at index 'i'
+        string objName = ObjectName(0, i, 0, -1);
 
-      // Check if the object's name starts with the prefix
-      if (StringSubstr(objName, 0, len) == prefix)
-      {
-         // If the prefix matches, delete the object
-         ObjectDelete(0, objName);
-         
-         // Since we deleted an object, we don't increment 'i', as the objects shift positions
-         total_objects--;  // Reduce total objects since one was deleted
-      }
-      else
-      {
-         // If the prefix does not match, move to the next object
-         i++;
-      }
-   }
+        // Check if the object's name starts with the prefix
+        if (StringSubstr(objName, 0, len) == prefix)
+        {
+            // If the prefix matches, delete the object
+            ObjectDelete(0, objName);
+            
+            // Since we deleted an object, we don't increment 'i', as the objects shift positions
+            total_objects--;  // Reduce total objects since one was deleted
+        }
+        else
+        {
+            // If the prefix does not match, move to the next object
+            i++;
+        }
+    }
 }
 //+------------------------------------------------------------------+
 //|                                                                  |
@@ -840,7 +883,7 @@ void showLabels()
 {
    // Get the time of the bar at the 'cnt' position
    datetime Time = iTime(Symbol(), timeframe, cnt);
-
+   
    // Loop through all identified zones
    for (int i = 0; i < zone_count; i++)
    {
@@ -1038,29 +1081,59 @@ int getEngulfing() {
    double currentPrice = close1;
    double pipDifference = 5 * _Point;
 
-   // Bullish Engulfing
+   // Define the body ratio threshold (e.g., 20% of the candle range)
+   double bodyRatioThreshold = 0.1;
+
+   // Check the body size of the previous candle (index 2)
+   double candleBodySize = MathAbs(open2 - close2);
+   double candleRange = high2 - low2;
+
+   // If the body size is less than the threshold, skip this candle for engulfing detection
+   if (candleBodySize / candleRange < bodyRatioThreshold) {
+      Print("Previous candle has a thin body. Ignoring this pattern for engulfing detection.");
+      return 0;
+   }
+
+   // Check if the current or previous candle touched any Supply or Demand zones
+   bool inDemandZone = false;
+   bool inSupplyZone = false;
+
+   for (int i = 0; i < zone_count; i++) {
+      // Check for demand (support) zones
+      if (zone_type[i] == ZONE_SUPPORT && ((low1 <= zone_hi[i] && low1 >= zone_lo[i]) || (low2 <= zone_hi[i] && low2 >= zone_lo[i]))) {
+         inDemandZone = true;
+         break;
+      }
+      // Check for supply (resistance) zones
+      if (zone_type[i] == ZONE_RESIST && ((high1 <= zone_hi[i] && high1 >= zone_lo[i]) || (high2 <= zone_hi[i] && high2 >= zone_lo[i]))) {
+         inSupplyZone = true;
+         break;
+      }
+   }
+
+   // Bullish Engulfing: Check if in demand zone and below the pivot
    if (open1 < close1 && open2 > close2) {
-      if (currentPrice <= s1 + 25 * _Point || currentPrice <= prevLow + 25 * _Point) {
+      if ((currentPrice <= s1 + 25 * _Point || currentPrice <= prevLow + 25 * _Point || inDemandZone) && currentPrice < pivot) {
          if (close1 > high2 && (close1 - high2) >= pipDifference) {
             if (lastBullishEngulfingObj != "") {
                ObjectDelete(0, lastBullishEngulfingObj);
                ObjectDelete(0, lastBullishEngulfingObj + "_Label");
             }
-            lastBullishEngulfingObj = createObjWithText(iTime(_Symbol, PERIOD_CURRENT, 1), low1, 217, clrGreen, "Bullish Engulfing");
+            lastBullishEngulfingObj = createObjWithText(iTime(_Symbol, PERIOD_CURRENT, 1), low1, 217, clrGreen, "Bullish Engulfing", false);
             return 1;
          }
       }
    }
 
-   // Bearish Engulfing
+   // Bearish Engulfing: Check if in supply zone and above the pivot
    if (open1 > close1 && open2 < close2) {
-      if (currentPrice > r1 - 10 * _Point || currentPrice > prevHigh - 10 * _Point) {
+      if ((currentPrice > r1 - 10 * _Point || currentPrice > prevHigh - 10 * _Point || inSupplyZone) && currentPrice > pivot) {
          if (close1 < low2 && (low2 - close1) >= pipDifference) {
             if (lastBearishEngulfingObj != "") {
                ObjectDelete(0, lastBearishEngulfingObj);
                ObjectDelete(0, lastBearishEngulfingObj + "_Label");
             }
-            lastBearishEngulfingObj = createObjWithText(iTime(_Symbol, PERIOD_CURRENT, 1), high1, 218, clrRed, "Bearish Engulfing");
+            lastBearishEngulfingObj = createObjWithText(iTime(_Symbol, PERIOD_CURRENT, 1), high1, 218, clrRed, "Bearish Engulfing", true);
             return -1;
          }
       }
@@ -1069,29 +1142,29 @@ int getEngulfing() {
    return 0;  // No pattern detected
 }
 
-string createObjWithText(datetime time, double price, int arrowCode, color clr, string txt) {
+string createObjWithText(datetime time, double price, int arrowCode, color clr, string txt, bool isBearish) {
    // Create a unique name for the arrow object
    string objName;
    StringConcatenate(objName, "Signal@", time, "at", DoubleToString(price, _Digits), "(", arrowCode, ")");
 
+   // Adjust the price for positioning the arrow above or below the candle
+   double arrowPrice = isBearish ? price + 70 * _Point : price - 70 * _Point; // Position arrow 50 points above/below the candle
+
    // Create the arrow object
-   if (ObjectCreate(0, objName, OBJ_ARROW, 0, time, price)) {
+   if (ObjectCreate(0, objName, OBJ_ARROW, 0, time, arrowPrice)) {
       ObjectSetInteger(0, objName, OBJPROP_ARROWCODE, arrowCode);
       ObjectSetInteger(0, objName, OBJPROP_COLOR, clr);
       ObjectSetInteger(0, objName, OBJPROP_WIDTH, 1);
       
-      // Set arrow anchor based on its color
-      if (clr == clrGreen)
-         ObjectSetInteger(0, objName, OBJPROP_ANCHOR, ANCHOR_TOP);  // Bullish arrow
-      else if (clr == clrRed)
-         ObjectSetInteger(0, objName, OBJPROP_ANCHOR, ANCHOR_BOTTOM);  // Bearish arrow
+      // Set arrow anchor based on its direction
+      ObjectSetInteger(0, objName, OBJPROP_ANCHOR, isBearish ? ANCHOR_TOP : ANCHOR_BOTTOM);  // Bearish arrow above, bullish arrow below
    }
 
    // Create a unique name for the text label
    string candleName = objName + "_Label";
 
    // Create the text label object
-   if (ObjectCreate(0, candleName, OBJ_TEXT, 0, time, price)) {
+   if (ObjectCreate(0, candleName, OBJ_TEXT, 0, time, arrowPrice)) {
       ObjectSetString(0, candleName, OBJPROP_TEXT, " " + txt);  // The label for the pattern
       ObjectSetInteger(0, candleName, OBJPROP_COLOR, clr);  // Text color matching the arrow
       ObjectSetInteger(0, candleName, OBJPROP_FONTSIZE, 10);  // Text font size
@@ -1140,13 +1213,14 @@ double calcLots(double slDistance, double &lots){
       double tickValue = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
       double volumeStep = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
       
-      double riskMoney = InpLotMode==LOT_MODE_MONEY ? InpLots : AccountInfoDouble(ACCOUNT_EQUITY) * InpLots * 0.01;
+      double riskMoney = InpLotMode == LOT_MODE_MONEY ? InpLots : AccountInfoDouble(ACCOUNT_EQUITY) * InpLots * 0.001;
       double moneyVolumeStep = (slDistance / tickSize) * tickValue * volumeStep;
       lots =  MathFloor(riskMoney/moneyVolumeStep) * volumeStep;
    }
    if(!CheckLots(lots)){return false;}
    return true;
 }
+
 
 bool CheckLots(double &lots){
    double min = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -1166,98 +1240,170 @@ bool CheckLots(double &lots){
    return true;
 }
 
-void OpenBuyOrder()
-{
-   // Ensure only one trade is running (check if there are any open positions)
-   if (PositionsTotal() > 0) 
-   {
-      Print("Cannot open Buy order. A position is already open.");
-      return;
-   }
-
-   double lots;
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // Get the current ask price
-   double sl = price - Slpoints * _Point; // Stop Loss 40 pips below current price
-   double tp = pivot; // Take Profit at the pivot level
-   if (!calcLots(price - sl, lots))  // Check if calcLots() returns true
-   {
-      Print("Lot size calculation failed. Unable to open Buy order.");
-      return;
-   }
-
-   // Setup trade request
-   MqlTradeRequest request;
-   MqlTradeResult result;
-   ZeroMemory(request);
-   ZeroMemory(result);
-
-   request.action = TRADE_ACTION_DEAL;         // Instant order
-   request.symbol = _Symbol;                   // Current symbol
-   request.volume = lots;                      // Lot size
-   request.type = ORDER_TYPE_BUY;              // Buy order
-   request.price = price;                      // Ask price
-   request.sl = sl;                            // Stop Loss level
-   request.tp = tp;                            // Take Profit level
-   request.deviation = 10;                     // Slippage
-   request.magic = MagicNumber;                // Magic number for the order
-   request.comment = "Bullish Engulfing";      // Comment for the order
-
-   if (OrderSend(request, result)) // Place the order
-   {
-      Print("Buy order placed successfully: ", result.order);
-      openPositionDate = TimeCurrent(); // Simpan tanggal saat ini ketika posisi dibuka
-   } 
-   else 
-   {
-      Print("Error placing buy order: ", GetLastError());
-   }
-}
-
 void OpenSellOrder()
 {
-   // Ensure only one trade is running (check if there are any open positions)
-   if (PositionsTotal() > 0) 
-   {
-      Print("Cannot open Sell order. A position is already open.");
-      return;
-   }
+    // Ensure only one trade is running (check if there are any open positions)
+    if (PositionsTotal() > 0) 
+    {
+        Print("Cannot open Sell order. A position is already open.");
+        return;
+    }
+   
+    // Check if the cooldown period has passed
+    if (TimeCurrent() - lastTradeTime < cooldownPeriodSeconds)
+    {
+        Print("Cooldown period active. No new trades are allowed at the moment.");
+        return;
+    }
 
-   double lots;
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID); // Get the current bid price
-   double sl = price + Slpoints * _Point; // Stop Loss 40 pips above current price
-   double tp = pivot; // Take Profit at the pivot level
-   if (!calcLots(sl - price, lots))  // Check if calcLots() returns true
-   {
-      Print("Lot size calculation failed. Unable to open Sell order.");
-      return;
-   }
+    double lots;
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID); // Get the current bid price
+    double sl;
+    
+    // Determine SL level based on user choice
+    if (UseSwingHighLowSL) {
+        sl = FindNearestSwingHigh(SwingLookbackPeriod) + 50 * _Point;  // Use the nearest swing high plus 50 points as SL
+    } else {
+        sl = price + Slpoints * _Point; // Fixed SL above the current price
+    }
 
-   // Setup trade request
-   MqlTradeRequest request;
-   MqlTradeResult result;
-   ZeroMemory(request);
-   ZeroMemory(result);
+    // Identify the nearest key level: either prevHigh or r1
+    double nearestKeyLevel = (price > prevHigh) ? prevHigh : r1;
+   
+    // Calculate the distance between the entry point and the nearest key level in pips
+    double distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
 
-   request.action = TRADE_ACTION_DEAL;         // Instant order
-   request.symbol = _Symbol;                   // Current symbol
-   request.volume = lots;                      // Lot size
-   request.type = ORDER_TYPE_SELL;             // Sell order
-   request.price = price;                      // Bid price
-   request.sl = sl;                            // Stop Loss level
-   request.tp = tp;                            // Take Profit level
-   request.deviation = 10;                     // Slippage
-   request.magic = MagicNumber;                // Magic number for the order
-   request.comment = "Bearish Engulfing";      // Comment for the order
+    // Minimum distance for TP is 30 pips, if less, use the next key level as TP
+    if (distanceToNearestLevel < 30)
+    {
+        nearestKeyLevel = r1; // Use r1 if the distance to prevHigh is less than 20 pips
+        distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
+      
+        // Check again if the new key level is still too close, use pivot as a fallback
+        if (distanceToNearestLevel < 30)
+        {
+            nearestKeyLevel = pivot; // Use pivot as a fallback
+        }
+    }
 
-   if (OrderSend(request, result)) // Place the order
-   {
-      Print("Sell order placed successfully: ", result.order);
-      openPositionDate = TimeCurrent(); // Simpan tanggal saat ini ketika posisi dibuka
-   } 
-   else 
-   {
-      Print("Error placing sell order: ", GetLastError());
-   }
+    double tp = nearestKeyLevel; // Set TP to the nearest valid key level
+
+    if (!calcLots(sl - price, lots))  // Check if calcLots() returns true
+    {
+        Print("Lot size calculation failed. Unable to open Sell order.");
+        return;
+    }
+
+    // Setup trade request
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+
+    request.action = TRADE_ACTION_DEAL;         // Instant order
+    request.symbol = _Symbol;                   // Current symbol
+    request.volume = lots;                      // Lot size
+    request.type = ORDER_TYPE_SELL;             // Sell order
+    request.price = price;                      // Bid price
+    request.sl = sl;                            // Stop Loss level
+    request.tp = tp;                            // Take Profit level
+    request.deviation = 10;                     // Slippage
+    request.magic = MagicNumber;                // Magic number for the order
+    request.comment = "Bearish Engulfing";      // Comment for the order
+
+    if (OrderSend(request, result)) // Place the order
+    {
+        Print("Sell order placed successfully: ", result.order);
+        openPositionDate = TimeCurrent(); // Store the current date when the position is opened
+        lastTradeTime = TimeCurrent();    // Update the last trade time to the current time
+    } 
+    else 
+    {
+        Print("Error placing sell order: ", GetLastError());
+    }
+}
+
+void OpenBuyOrder()
+{
+    // Ensure only one trade is running (check if there are any open positions)
+    if (PositionsTotal() > 0) 
+    {
+        Print("Cannot open Buy order. A position is already open.");
+        return;
+    }
+   
+    // Check if the cooldown period has passed
+    if (TimeCurrent() - lastTradeTime < cooldownPeriodSeconds)
+    {
+        Print("Cooldown period active. No new trades are allowed at the moment.");
+        return;
+    }
+
+    double lots;
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // Get the current ask price
+    double sl;
+    
+    // Determine SL level based on user choice
+    if (UseSwingHighLowSL) {
+        sl = FindNearestSwingLow(SwingLookbackPeriod) - 50 * _Point;  // Use the nearest swing low minus 50 points as SL
+    } else {
+        sl = price - Slpoints * _Point; // Fixed SL below the current price
+    }
+
+    // Identify the nearest key level: either s1 or prevLow
+    double nearestKeyLevel = (price < s1) ? s1 : prevLow;
+   
+    // Calculate the distance between the entry point and the nearest key level in pips
+    double distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
+
+    // Minimum distance for TP is 20 pips, if less, use the next key level as TP
+    if (distanceToNearestLevel < 30)
+    {
+        nearestKeyLevel = prevLow; // Use prevLow if the distance to s1 is less than 20 pips
+        distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
+      
+        // Check again if the new key level is still too close, use pivot as a fallback
+        if (distanceToNearestLevel < 30)
+        {
+            nearestKeyLevel = pivot; // Use pivot as a fallback
+        }
+    }
+
+    double tp = nearestKeyLevel; // Set TP to the nearest valid key level
+
+    if (!calcLots(price - sl, lots))  // Check if calcLots() returns true
+    {
+        Print("Lot size calculation failed. Unable to open Buy order.");
+        return;
+    }
+
+    // Setup trade request
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+
+    request.action = TRADE_ACTION_DEAL;         // Instant order
+    request.symbol = _Symbol;                   // Current symbol
+    request.volume = lots;                      // Lot size
+    request.type = ORDER_TYPE_BUY;              // Buy order
+    request.price = price;                      // Ask price
+    request.sl = sl;                            // Stop Loss level
+    request.tp = tp;                            // Take Profit level
+    request.deviation = 10;                     // Slippage
+    request.magic = MagicNumber;                // Magic number for the order
+    request.comment = "Bullish Engulfing";      // Comment for the order
+
+    if (OrderSend(request, result)) // Place the order
+    {
+        Print("Buy order placed successfully: ", result.order);
+        openPositionDate = TimeCurrent(); // Store the current date when the position is opened
+        lastTradeTime = TimeCurrent();    // Update the last trade time to the current time
+    } 
+    else 
+    {
+        Print("Error placing buy order: ", GetLastError());
+    }
 }
 
 void UpdateStopLoss(){
@@ -1383,4 +1529,57 @@ void CheckClosePositionByDay()
       }
    }
 }
+
+// Find the nearest swing high within the specified lookback period
+double FindNearestSwingHigh(int lookbackPeriod) {
+    double swingHigh = iHigh(_Symbol, PERIOD_CURRENT, 1);  // Start with the previous candle's high
+    for (int i = 1; i <= lookbackPeriod; i++) {
+        double currentHigh = iHigh(_Symbol, PERIOD_CURRENT, i);
+        if (currentHigh > swingHigh) {
+            swingHigh = currentHigh;
+        }
+    }
+    return swingHigh;
+}
+
+// Find the nearest swing low within the specified lookback period
+double FindNearestSwingLow(int lookbackPeriod) {
+    double swingLow = iLow(_Symbol, PERIOD_CURRENT, 1);  // Start with the previous candle's low
+    for (int i = 1; i <= lookbackPeriod; i++) {
+        double currentLow = iLow(_Symbol, PERIOD_CURRENT, i);
+        if (currentLow < swingLow) {
+            swingLow = currentLow;
+        }
+    }
+    return swingLow;
+}
+
+void RefreshTimeframeData()
+{
+    // Reset last bar time to handle new timeframe correctly
+    datetime lastBarTime = 0;
+
+    // Determine the number of bars available in the new timeframe
+    int bars = Bars(_Symbol, timeframe);
+    
+    // Resize arrays to the new timeframe's bar count
+    ArrayResize(High, bars);
+    ArrayResize(Low, bars);
+    ArrayResize(Close, bars);
+    ArrayResize(ATR, bars);
+
+    // Initialize the data arrays with the latest data
+    for (int i = 0; i < bars; i++) {
+        High[i] = iHigh(_Symbol, timeframe, i);
+        Low[i] = iLow(_Symbol, timeframe, i);
+        Close[i] = iClose(_Symbol, timeframe, i);
+    }
+
+    // Refresh ATR values for the new timeframe
+    if (CopyBuffer(iATR_handle, 0, 0, bars, ATR) == -1) {
+        Print("Failed to copy ATR data for the new timeframe.");
+        return;
+    }
+}
+
 //+------------------------------------------------------------------+
