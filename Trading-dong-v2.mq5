@@ -121,6 +121,11 @@ datetime openPositionDate;
 bool newBarDetected = false;  // Flag to track new bar detection
 datetime lastTradeTime = 0;  // Stores the time of the last trade
 int cooldownPeriodSeconds = 1800;  // Cooldown period in seconds (e.g., 1800 seconds = 30 minutes)
+string sessionBias = "Unknown";  // To store the current session bias
+string sessionBiasLabelName = "SessionBiasLabel";  // Name for the GUI text label
+bool isTradeOpen = false;  // Global flag to track if a trade is open
+ulong tp1OrderID = 0;
+ulong tp2OrderID = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -181,6 +186,10 @@ void OnDeinit(const int reason){
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    // Return early if a trade is already open
+    if (isTradeOpen)
+        return;
+
     // Check for new bar only, avoid heavy calculations here
     if (NewBar())
     {
@@ -189,7 +198,6 @@ void OnTick()
 
     // Check for engulfing patterns and manage trades
     int engulfingSignal = getEngulfing(); // 1 for Bullish Engulfing, -1 for Bearish Engulfing, 0 for no signal
-    //int DominantBreakSignal = getDominantBreak();
 
     if (engulfingSignal == 1) // Bullish Engulfing detected
     {
@@ -205,6 +213,8 @@ void OnTick()
 
     // Check if it's the end of the day to close open positions
     CheckClosePositionByDay();
+    
+    MoveSLToBreakeven();
 }
 
 //+------------------------------------------------------------------+
@@ -212,7 +222,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   if (newBarDetected)
+    if (newBarDetected)
     {
         // Perform heavy calculations here
         FastFractals();
@@ -231,6 +241,9 @@ void OnTimer()
 
         DrawPivotLevels();
         showLabels();
+
+        // Detect session bias
+        DetectSessionBias();
 
         newBarDetected = false;  // Reset flag after processing
     }
@@ -1079,10 +1092,10 @@ int getEngulfing() {
    double low2 = iLow(_Symbol, PERIOD_CURRENT, 2);
 
    double currentPrice = close1;
-   double pipDifference = 5 * _Point;
+   double pipDifference = 30 * _Point;
 
    // Define the body ratio threshold (e.g., 20% of the candle range)
-   double bodyRatioThreshold = 0.1;
+   double bodyRatioThreshold = 0.15;
 
    // Check the body size of the previous candle (index 2)
    double candleBodySize = MathAbs(open2 - close2);
@@ -1242,8 +1255,8 @@ bool CheckLots(double &lots){
 
 void OpenSellOrder()
 {
-    // Ensure only one trade is running (check if there are any open positions)
-    if (PositionsTotal() > 0) 
+    // Ensure only one trade is running (check if there are any open positions by magic number)
+    if (GetOpenPositionCountByMagic(MagicNumber) > 0) 
     {
         Print("Cannot open Sell order. A position is already open.");
         return;
@@ -1256,7 +1269,7 @@ void OpenSellOrder()
         return;
     }
 
-    double lots;
+    double totalLots;
     double price = SymbolInfoDouble(_Symbol, SYMBOL_BID); // Get the current bid price
     double sl;
     
@@ -1268,65 +1281,104 @@ void OpenSellOrder()
     }
 
     // Identify the nearest key level: either prevHigh or r1
-    double nearestKeyLevel = (price > prevHigh) ? prevHigh : r1;
+    double nearestKeyLevel = (price > r1) ? r1 : prevHigh;
+    double nextKeyLevel;
    
     // Calculate the distance between the entry point and the nearest key level in pips
     double distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
 
-    // Minimum distance for TP is 30 pips, if less, use the next key level as TP
-    if (distanceToNearestLevel < 30)
+    // Minimum distance for TP is 30 pips, if less, use the next key level
+    if (distanceToNearestLevel < 400)
     {
-        nearestKeyLevel = r1; // Use r1 if the distance to prevHigh is less than 20 pips
+        nearestKeyLevel = prevHigh; // Use prevHigh if the distance to r1 is less than 30 pips
         distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
-      
+
         // Check again if the new key level is still too close, use pivot as a fallback
-        if (distanceToNearestLevel < 30)
+        if (distanceToNearestLevel < 400)
         {
             nearestKeyLevel = pivot; // Use pivot as a fallback
         }
     }
 
-    double tp = nearestKeyLevel; // Set TP to the nearest valid key level
+    // Determine the next key level dynamically
+    nextKeyLevel = pivot; // Use pivot as the next key level for simplicity
 
-    if (!calcLots(sl - price, lots))  // Check if calcLots() returns true
+    // Set the take profits for both trades
+    double tp1 = nearestKeyLevel; 
+    double tp2 = nextKeyLevel; 
+
+    // Calculate the lot sizes for the two trades
+    if (!calcLots(sl - price, totalLots))
     {
         Print("Lot size calculation failed. Unable to open Sell order.");
         return;
     }
 
-    // Setup trade request
-    MqlTradeRequest request;
-    MqlTradeResult result;
-    ZeroMemory(request);
-    ZeroMemory(result);
+    double lots1 = totalLots / 2;
+    double lots2 = totalLots / 2;
 
-    request.action = TRADE_ACTION_DEAL;         // Instant order
-    request.symbol = _Symbol;                   // Current symbol
-    request.volume = lots;                      // Lot size
-    request.type = ORDER_TYPE_SELL;             // Sell order
-    request.price = price;                      // Bid price
-    request.sl = sl;                            // Stop Loss level
-    request.tp = tp;                            // Take Profit level
-    request.deviation = 10;                     // Slippage
-    request.magic = MagicNumber;                // Magic number for the order
-    request.comment = "Bearish Engulfing";      // Comment for the order
+    // Setup the first trade request
+    MqlTradeRequest request1;
+    MqlTradeResult result1;
+    ZeroMemory(request1);
+    ZeroMemory(result1);
 
-    if (OrderSend(request, result)) // Place the order
+    request1.action = TRADE_ACTION_DEAL;         // Instant order
+    request1.symbol = _Symbol;                   // Current symbol
+    request1.volume = lots1;                     // Half lot size
+    request1.type = ORDER_TYPE_SELL;             // Sell order
+    request1.price = price;                      // Bid price
+    request1.sl = sl;                            // Stop Loss level
+    request1.tp = tp1;                           // Take Profit level
+    request1.deviation = 10;                     // Slippage
+    request1.magic = MagicNumber;                // Magic number for the order
+    request1.comment = "Bearish Engulfing TP1";  // Comment for the order
+
+    if (OrderSend(request1, result1)) // Place the first order
     {
-        Print("Sell order placed successfully: ", result.order);
+        Print("First Sell order placed successfully: ", result1.order);
+        tp1OrderID = result1.order; // Store the ID of the first order
+    } 
+    else 
+    {
+        Print("Error placing the first sell order: ", GetLastError());
+        return; // Exit if the first order fails
+    }
+
+    // Setup the second trade request
+    MqlTradeRequest request2;
+    MqlTradeResult result2;
+    ZeroMemory(request2);
+    ZeroMemory(result2);
+
+    request2.action = TRADE_ACTION_DEAL;         // Instant order
+    request2.symbol = _Symbol;                   // Current symbol
+    request2.volume = lots2;                     // Half lot size
+    request2.type = ORDER_TYPE_SELL;             // Sell order
+    request2.price = price;                      // Bid price
+    request2.sl = sl;                            // Stop Loss level
+    request2.tp = tp2;                           // Take Profit level
+    request2.deviation = 10;                     // Slippage
+    request2.magic = MagicNumber;                // Magic number for the order
+    request2.comment = "Bearish Engulfing TP2";  // Comment for the order
+
+    if (OrderSend(request2, result2)) // Place the second order
+    {
+        Print("Second Sell order placed successfully: ", result2.order);
+        tp2OrderID = result2.order; // Store the ID of the second order
         openPositionDate = TimeCurrent(); // Store the current date when the position is opened
         lastTradeTime = TimeCurrent();    // Update the last trade time to the current time
     } 
     else 
     {
-        Print("Error placing sell order: ", GetLastError());
+        Print("Error placing the second sell order: ", GetLastError());
     }
 }
 
 void OpenBuyOrder()
 {
-    // Ensure only one trade is running (check if there are any open positions)
-    if (PositionsTotal() > 0) 
+    // Ensure only one trade is running (check if there are any open positions by magic number)
+    if (GetOpenPositionCountByMagic(MagicNumber) > 0) 
     {
         Print("Cannot open Buy order. A position is already open.");
         return;
@@ -1339,7 +1391,7 @@ void OpenBuyOrder()
         return;
     }
 
-    double lots;
+    double totalLots;
     double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK); // Get the current ask price
     double sl;
     
@@ -1352,57 +1404,96 @@ void OpenBuyOrder()
 
     // Identify the nearest key level: either s1 or prevLow
     double nearestKeyLevel = (price < s1) ? s1 : prevLow;
+    double nextKeyLevel;
    
     // Calculate the distance between the entry point and the nearest key level in pips
     double distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
 
-    // Minimum distance for TP is 20 pips, if less, use the next key level as TP
-    if (distanceToNearestLevel < 30)
+    // Minimum distance for TP is 30 pips, if less, choose another key level
+    if (distanceToNearestLevel < 400)
     {
-        nearestKeyLevel = prevLow; // Use prevLow if the distance to s1 is less than 20 pips
+        nearestKeyLevel = prevLow; // Use prevLow if the distance to s1 is less than 30 pips
         distanceToNearestLevel = MathAbs(price - nearestKeyLevel) / _Point;
-      
-        // Check again if the new key level is still too close, use pivot as a fallback
-        if (distanceToNearestLevel < 30)
+
+        // Check again if the new key level is still too close, use another level
+        if (distanceToNearestLevel < 400)
         {
             nearestKeyLevel = pivot; // Use pivot as a fallback
         }
     }
 
-    double tp = nearestKeyLevel; // Set TP to the nearest valid key level
+    // Determine the next key level dynamically
+    nextKeyLevel = pivot; // Since dynamic calculation can be heavy, default to pivot
 
-    if (!calcLots(price - sl, lots))  // Check if calcLots() returns true
+    // Set the take profits for both trades
+    double tp1 = nearestKeyLevel; 
+    double tp2 = nextKeyLevel; 
+
+    // Calculate the lot sizes for the two trades
+    if (!calcLots(price - sl, totalLots))
     {
         Print("Lot size calculation failed. Unable to open Buy order.");
         return;
     }
 
-    // Setup trade request
-    MqlTradeRequest request;
-    MqlTradeResult result;
-    ZeroMemory(request);
-    ZeroMemory(result);
+    double lots1 = totalLots / 2;
+    double lots2 = totalLots / 2;
 
-    request.action = TRADE_ACTION_DEAL;         // Instant order
-    request.symbol = _Symbol;                   // Current symbol
-    request.volume = lots;                      // Lot size
-    request.type = ORDER_TYPE_BUY;              // Buy order
-    request.price = price;                      // Ask price
-    request.sl = sl;                            // Stop Loss level
-    request.tp = tp;                            // Take Profit level
-    request.deviation = 10;                     // Slippage
-    request.magic = MagicNumber;                // Magic number for the order
-    request.comment = "Bullish Engulfing";      // Comment for the order
+    // Setup the first trade request
+    MqlTradeRequest request1;
+    MqlTradeResult result1;
+    ZeroMemory(request1);
+    ZeroMemory(result1);
 
-    if (OrderSend(request, result)) // Place the order
+    request1.action = TRADE_ACTION_DEAL;         // Instant order
+    request1.symbol = _Symbol;                   // Current symbol
+    request1.volume = lots1;                     // Half lot size
+    request1.type = ORDER_TYPE_BUY;              // Buy order
+    request1.price = price;                      // Ask price
+    request1.sl = sl;                            // Stop Loss level
+    request1.tp = tp1;                           // Take Profit level
+    request1.deviation = 10;                     // Slippage
+    request1.magic = MagicNumber;                // Magic number for the order
+    request1.comment = "Bullish Engulfing TP1";  // Comment for the order
+
+    if (OrderSend(request1, result1)) // Place the first order
     {
-        Print("Buy order placed successfully: ", result.order);
+        Print("First Buy order placed successfully: ", result1.order);
+        tp1OrderID = result1.order; // Store the ID of the first order
+    } 
+    else 
+    {
+        Print("Error placing the first buy order: ", GetLastError());
+        return; // Exit if the first order fails
+    }
+
+    // Setup the second trade request
+    MqlTradeRequest request2;
+    MqlTradeResult result2;
+    ZeroMemory(request2);
+    ZeroMemory(result2);
+
+    request2.action = TRADE_ACTION_DEAL;         // Instant order
+    request2.symbol = _Symbol;                   // Current symbol
+    request2.volume = lots2;                     // Half lot size
+    request2.type = ORDER_TYPE_BUY;              // Buy order
+    request2.price = price;                      // Ask price
+    request2.sl = sl;                            // Stop Loss level
+    request2.tp = tp2;                           // Take Profit level
+    request2.deviation = 10;                     // Slippage
+    request2.magic = MagicNumber;                // Magic number for the order
+    request2.comment = "Bullish Engulfing TP2";  // Comment for the order
+
+    if (OrderSend(request2, result2)) // Place the second order
+    {
+        Print("Second Buy order placed successfully: ", result2.order);
+        tp2OrderID = result2.order; // Store the ID of the second order
         openPositionDate = TimeCurrent(); // Store the current date when the position is opened
         lastTradeTime = TimeCurrent();    // Update the last trade time to the current time
     } 
     else 
     {
-        Print("Error placing buy order: ", GetLastError());
+        Print("Error placing the second buy order: ", GetLastError());
     }
 }
 
@@ -1489,17 +1580,17 @@ void UpdateStopLoss(){
 
 void CheckClosePositionByDay()
 {
-   // Cek jika ada posisi terbuka
+   // Check if there are open positions
    if (PositionsTotal() > 0) 
    {
-      datetime currentDate = TimeCurrent(); // Dapatkan waktu saat ini
+      datetime currentDate = TimeCurrent(); // Get the current time
       MqlDateTime openDateTime, currentDateTime;
 
-      // Konversi waktu posisi terbuka dan waktu saat ini ke struktur MqlDateTime
+      // Convert the open position time and current time to MqlDateTime structures
       TimeToStruct(openPositionDate, openDateTime);
       TimeToStruct(currentDate, currentDateTime);
 
-      // Jika hari sudah berubah dibandingkan dengan hari posisi dibuka
+      // If the day has changed since the position was opened
       if (openDateTime.day != currentDateTime.day)
       {
          for (int i = PositionsTotal() - 1; i >= 0; i--) 
@@ -1515,17 +1606,20 @@ void CheckClosePositionByDay()
                   
                   if (type == POSITION_TYPE_BUY) 
                   {
-                     trade.PositionClose(ticket); // Tutup posisi buy
+                     trade.PositionClose(ticket); // Close buy position
                   }
                   else if (type == POSITION_TYPE_SELL) 
                   {
-                     trade.PositionClose(ticket); // Tutup posisi sell
+                     trade.PositionClose(ticket); // Close sell position
                   }
 
                   Print("Position closed due to day change.");
                }
             }
          }
+         
+         // Reset the trade open flag after closing positions
+         isTradeOpen = false;
       }
    }
 }
@@ -1580,6 +1674,122 @@ void RefreshTimeframeData()
         Print("Failed to copy ATR data for the new timeframe.");
         return;
     }
+}
+
+void DetectSessionBias()
+{
+    ENUM_TIMEFRAMES TimeframeD1 = PERIOD_D1;  // Daily timeframe
+    ENUM_TIMEFRAMES TimeframeH4 = PERIOD_H4;  // 4-hour timeframe
+
+    // Get previous day's open and close
+    double prevDailyOpen = iOpen(_Symbol, TimeframeD1, 1);
+    double prevDailyClose = iClose(_Symbol, TimeframeD1, 1);
+
+    // Get previous H4 candle's open and close
+    double prevH4Open = iOpen(_Symbol, TimeframeH4, 1);
+    double prevH4Close = iClose(_Symbol, TimeframeH4, 1);
+
+    // Determine the daily bias
+    bool isDailyBullish = prevDailyClose > prevDailyOpen;
+    bool isDailyBearish = prevDailyClose < prevDailyOpen;
+
+    // Determine the H4 bias
+    bool isH4Bullish = prevH4Close > prevH4Open;
+    bool isH4Bearish = prevH4Close < prevH4Open;
+
+    // Determine the session bias based on the conditions provided
+    if (isDailyBullish && isH4Bullish) {
+        sessionBias = "Bullish";
+    } else if (isDailyBearish && isH4Bearish) {
+        sessionBias = "Bearish";
+    } else {
+        sessionBias = "Mixed";
+    }
+
+    // Display the session bias on the chart
+    DisplaySessionBiasOnChart();
+}
+
+void DisplaySessionBiasOnChart()
+{
+    // Define the properties of the text on the chart
+    int corner = CORNER_LEFT_UPPER;  // Corner of the chart where the label will be placed
+    int xDistance = 10;              // X distance from the specified corner
+    int yDistance = 40;              // Y distance from the specified corner
+
+    // Create or update the text label for the session bias
+    if (ObjectFind(0, sessionBiasLabelName) < 0) {
+        ObjectCreate(0, sessionBiasLabelName, OBJ_LABEL, 0, 0, 0);  // OBJ_LABEL does not use time/price
+        ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_CORNER, corner);
+        ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_XDISTANCE, xDistance);
+        ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_YDISTANCE, yDistance);
+        ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_STYLE, OBJ_RECTANGLE); // Set background style as rectangle
+        ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_BACK, true); // Enable the background
+    }
+
+    // Set a constant background color
+    ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_COLOR, clrBlack); // Set background color
+    ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_FONTSIZE, 12);
+    ObjectSetString(0, sessionBiasLabelName, OBJPROP_FONT, "Arial");
+
+    // Set the color for the bias text
+    color biasColor;
+    if (sessionBias == "Bullish") {
+        biasColor = clrGreen;
+    } else if (sessionBias == "Bearish") {
+        biasColor = clrRed;
+    } else {
+        biasColor = clrBlue;  // Mixed bias in blue
+    }
+
+    // Update the text to show the current session bias
+    string labelText = "Session Bias: ";
+    ObjectSetString(0, sessionBiasLabelName, OBJPROP_TEXT, labelText + sessionBias);
+
+    // Set the color of the session bias text
+    ObjectSetInteger(0, sessionBiasLabelName, OBJPROP_COLOR, biasColor);
+}
+
+void MoveSLToBreakeven() {
+    // Check if the first trade (tp1) has been closed
+    if (tp1OrderID > 0 && !PositionSelectByTicket(tp1OrderID)) {
+        // The first trade is closed; check the second trade
+        if (tp2OrderID > 0 && PositionSelectByTicket(tp2OrderID)) {
+            double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double newSL = entryPrice; // Move SL to entry price for breakeven
+            
+            // Modify the second trade to move its SL to breakeven
+            MqlTradeRequest request;
+            MqlTradeResult result;
+            ZeroMemory(request);
+            ZeroMemory(result);
+
+            request.action = TRADE_ACTION_SLTP;
+            request.position = tp2OrderID;
+            request.symbol = _Symbol;
+            request.sl = newSL;  // Set new SL to breakeven
+            request.tp = PositionGetDouble(POSITION_TP);  // Keep the existing TP
+
+            if (!OrderSend(request, result)) {
+                Print("Failed to modify SL to breakeven. Error: ", GetLastError());
+            } else {
+                Print("SL moved to breakeven for order: ", tp2OrderID);
+            }
+        }
+    }
+}
+
+// Helper function to count open positions by MagicNumber
+int GetOpenPositionCountByMagic(int magicNumber)
+{
+    int count = 0;
+    for (int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if (PositionGetInteger(POSITION_MAGIC) == magicNumber)
+            count++;
+    }
+    return count;
 }
 
 //+------------------------------------------------------------------+
